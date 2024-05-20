@@ -1,0 +1,83 @@
+---
+- name: Install packages
+  hosts: k8s_cluster
+  become: true
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+  ## Install Open VM Tools and enable service
+    - name: Install packages
+      ansible.builtin.apt:
+        name: open-vm-tools
+        state: present
+      when: ansible_product_name is match('VMware*')
+
+    - name: Enable vmtoolsd
+      ansible.builtin.systemd_service:
+        name: vmtoolsd
+        enabled: true
+        state: started
+      when: ansible_product_name is match('VMware*')
+
+  ## Install MicroK8s & Setup User Permissions
+    - name: Install MicroK8s
+      community.general.snap:
+        name: microk8s
+        classic: true
+        state: present
+
+    - name: Add user to MicroK8s group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: microk8s
+        append: true
+
+    - name: Reset Connection
+      ansible.builtin.meta: reset_connection
+
+    - name: Change kube folder permissions
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.kube"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
+        state: directory
+
+- name: Master setup
+  hosts: k8s_master
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Enable MicroK8s modules
+      ansible.builtin.command: microk8s enable dashboard dns registry istio
+      register: k8s_modules
+      changed_when: "k8s_modules.rc == 0"
+
+- name: Node setup
+  hosts: k8s_nodes
+  become: true
+  tasks:
+    - name: Get cluster status as json
+      ansible.utils.cli_parse:
+        command: microk8s kubectl -o json get nodes
+        parser:
+          name: ansible.utils.json
+        set_fact: k8s_status
+      delegate_to: "{{ groups['k8s_master'][0] }}"
+
+    - name: Get join token from master
+      ansible.utils.cli_parse:
+        command: "microk8s add-node --format json"
+        parser:
+          name: ansible.utils.json
+        set_fact: k8s_join
+      delegate_to: "{{ groups['k8s_master'][0] }}"
+      when: not ansible_host in (k8s_status | json_query('items[*].metadata.name'))
+
+    - name: Join nodes to cluster
+      ansible.builtin.command: "microk8s join {{ k8s_join.urls[0] }} --worker"
+      changed_when: "k8s_join_output.rc == 0"
+      when: not ansible_host in (k8s_status | json_query('items[*].metadata.name'))
